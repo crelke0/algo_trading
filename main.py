@@ -20,7 +20,8 @@ def engine(strategy, market_data, ticker_to_idx, feature_to_idx):
     for d in range(len(market_data) - 2):
         capital_allocation = strategy(capital_allocation, market_data[:d + 1], ticker_to_idx, feature_to_idx)
         uninvested = 1 - sum(capital_allocation)
-        if uninvested < 0:
+        if uninvested < -1e-6:
+            print(uninvested)
             raise ValueError("Capital allocation values must sum to less than 1.")
 
         day_return = 0.0
@@ -33,14 +34,19 @@ def engine(strategy, market_data, ticker_to_idx, feature_to_idx):
 
     return returns, equity_curve
 
-def monte_carlo_simulation(strategy, market_data, ticker_to_idx, feature_to_idx, num_simulations=1000):
+def monte_carlo_simulation(make_strategy, market_data, ticker_to_idx, feature_to_idx, training_fraction=0.8, num_simulations=1000):
+    test_idx = int(len(market_data)*training_fraction)
+    
     sharpe_ratios = []
-    actual_returns, _ = engine(strategy, market_data, ticker_to_idx, feature_to_idx)
+    strategy = make_strategy(market_data, ticker_to_idx, feature_to_idx, training_fraction=training_fraction)
+    actual_returns, _ = engine(strategy, market_data[test_idx:], ticker_to_idx, feature_to_idx)
     actual_sharpe = calculate_sharpe_ratio(actual_returns)
+    print(f"Actual Sharpe Ratio: {actual_sharpe:.4f}")
     random_wins = 0
     for _ in range(num_simulations):
         permuted_data = permute_data(market_data, feature_to_idx)
-        returns, _ = engine(strategy, permuted_data, ticker_to_idx, feature_to_idx)
+        strategy = make_strategy(permuted_data, ticker_to_idx, feature_to_idx, training_fraction=training_fraction)
+        returns, _ = engine(strategy, permuted_data[test_idx:], ticker_to_idx, feature_to_idx)
         sharpe_ratio = calculate_sharpe_ratio(returns)
         if sharpe_ratio >= actual_sharpe:
             random_wins += 1
@@ -51,12 +57,13 @@ def monte_carlo_simulation(strategy, market_data, ticker_to_idx, feature_to_idx,
     return p_value, mean, std
 
 def permute_data(market_data, feature_to_idx):
-    r_o = market_data[1:, :, feature_to_idx["Open"]] - market_data[:-1, :, feature_to_idx["Close"]]
+    log_data = np.log(market_data)
+    r_o = log_data[1:, :, feature_to_idx["Open"]] - log_data[:-1, :, feature_to_idx["Close"]]
 
-    open_prices = market_data[:, :, feature_to_idx["Open"]]
-    r_h = market_data[:, :, feature_to_idx["High"]] - open_prices
-    r_l = market_data[:, :, feature_to_idx["Low"]] - open_prices
-    r_c = market_data[:, :, feature_to_idx["Close"]] - open_prices
+    open_prices = log_data[:, :, feature_to_idx["Open"]]
+    r_h = log_data[:, :, feature_to_idx["High"]] - open_prices
+    r_l = log_data[:, :, feature_to_idx["Low"]] - open_prices
+    r_c = log_data[:, :, feature_to_idx["Close"]] - open_prices
 
     np.random.shuffle(r_o)
 
@@ -76,7 +83,7 @@ def permute_data(market_data, feature_to_idx):
         permuted_data[i, :, feature_to_idx["Low"]] = todays_open + r_l[i]
         permuted_data[i, :, feature_to_idx["Close"]] = todays_open + r_c[i]
 
-    return permuted_data
+    return np.exp(permuted_data)
 
 def format_yfinance_data(tickers, period):
     market_data = yf.download(tickers, period=period, auto_adjust=True).ffill().bfill()
@@ -98,11 +105,24 @@ def format_yfinance_data(tickers, period):
     return X, ticker_to_idx, feature_to_idx
 
 tickers = ["AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "NVDA", "META"]
+years_held_out = 4
 
-market_data, ticker_to_idx, feature_to_idx = format_yfinance_data(tickers, "1y")
-returns, equity_curve = engine(strategies.diversify, market_data, ticker_to_idx, feature_to_idx)
+market_data, ticker_to_idx, feature_to_idx = format_yfinance_data(tickers, "20y")[-252*years_held_out:]
+
+training_fraction = 0.8
+
+# p_value, mean, std = monte_carlo_simulation(strategies.make_svdd_strategy, market_data, ticker_to_idx, feature_to_idx, num_simulations=100, training_fraction=training_fraction)
+# print(f"Monte Carlo Simulation p-value: {p_value:.4f}, Mean Sharpe Ratio: {mean:.4f}, Std Dev: {std:.4f}")
+
+# test_idx = int(len(market_data)*training_fraction)
+# returns, _ = engine(strategies.diversify, market_data[], ticker_to_idx, feature_to_idx)
+# sharpe_ratio = calculate_sharpe_ratio(returns)
+# print(f"Diversify Strategy Sharpe Ratio: {sharpe_ratio:.4f}")
+
+strategy = strategies.make_reconstruction_strategy(market_data, ticker_to_idx, feature_to_idx, training_fraction=training_fraction)
+returns, equity_curve = engine(strategy, market_data[int(len(market_data)*training_fraction):], ticker_to_idx, feature_to_idx)
 sharpe_ratio = calculate_sharpe_ratio(returns)
-print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
+print(f"Reconstruction Strategy Sharpe Ratio: {sharpe_ratio:.4f}")
 
-p_value, mean, std = monte_carlo_simulation(strategies.diversify, market_data, ticker_to_idx, feature_to_idx)
-print(f"Monte Carlo p-value: {p_value:.4f}, Mean: {mean:.4f}, Std: {std:.4f}")
+# p_value, mean, std = monte_carlo_simulation(strategies.make_reconstruction_strategy, market_data, ticker_to_idx, feature_to_idx, num_simulations=100, training_fraction=training_fraction)
+# print(f"Monte Carlo Simulation p-value: {p_value:.4f}, Mean Sharpe Ratio: {mean:.4f}, Std Dev: {std:.4f}")
