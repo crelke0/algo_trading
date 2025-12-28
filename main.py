@@ -104,25 +104,12 @@ def format_yfinance_data(tickers, period):
     feature_to_idx = {feature: i for i, feature in enumerate(features)}
     return X, ticker_to_idx, feature_to_idx
 
-tickers = ["AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "NVDA", "META"]
+tickers = ["AAPL", "MSFT", "GOOG", "NVDA", "META"]
+
 years_held_out = 4
 
 market_data, ticker_to_idx, feature_to_idx = format_yfinance_data(tickers, "20y")[-252*years_held_out:]
 
 training_fraction = 0.8
 
-# p_value, mean, std = monte_carlo_simulation(strategies.make_svdd_strategy, market_data, ticker_to_idx, feature_to_idx, num_simulations=100, training_fraction=training_fraction)
-# print(f"Monte Carlo Simulation p-value: {p_value:.4f}, Mean Sharpe Ratio: {mean:.4f}, Std Dev: {std:.4f}")
-
-# test_idx = int(len(market_data)*training_fraction)
-# returns, _ = engine(strategies.diversify, market_data[], ticker_to_idx, feature_to_idx)
-# sharpe_ratio = calculate_sharpe_ratio(returns)
-# print(f"Diversify Strategy Sharpe Ratio: {sharpe_ratio:.4f}")
-
-strategy = strategies.make_reconstruction_strategy(market_data, ticker_to_idx, feature_to_idx, training_fraction=training_fraction)
-returns, equity_curve = engine(strategy, market_data[int(len(market_data)*training_fraction):], ticker_to_idx, feature_to_idx)
-sharpe_ratio = calculate_sharpe_ratio(returns)
-print(f"Reconstruction Strategy Sharpe Ratio: {sharpe_ratio:.4f}")
-
-# p_value, mean, std = monte_carlo_simulation(strategies.make_reconstruction_strategy, market_data, ticker_to_idx, feature_to_idx, num_simulations=100, training_fraction=training_fraction)
-# print(f"Monte Carlo Simulation p-value: {p_value:.4f}, Mean Sharpe Ratio: {mean:.4f}, Std Dev: {std:.4f}")
+strategies.make_ml_statarb_strategy(market_data, ticker_to_idx, feature_to_idx, training_fraction=training_fraction)

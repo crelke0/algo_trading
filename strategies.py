@@ -346,3 +346,131 @@ def make_reconstruction_strategy(market_data, ticker_to_idx, feature_to_idx, tra
         fractions /= fractions.sum()
         return fractions.tolist()
     return strategy
+
+# class StatArbModel(nn.Module):
+#     def __init__(self, n_tickers, window, factor_hls=(32, 3)):
+#         super().__init__()
+#         dims = [n_tickers*window] + list(factor_hls) + [n_tickers]
+#         self.layers = nn.ModuleList(
+#             nn.Linear(dims[i], dims[i+1], bias=i!=len(dims)-2) # no bias on last layer (factor head to expected returns is linear)
+#             for i in range(len(dims) - 1)
+#         )
+#     def forward(self, x):
+#         for layer in self.layers[:-1]:
+#             x = F.relu(layer(x))
+#         factor_head = x
+#         x = self.layers[-1](factor_head)
+#         return x.squeeze(-1), factor_head
+    
+class StatArbModel(nn.Module):
+    def __init__(self, n_tickers, window, factor_hls=(32, 3)):
+        super().__init__()
+        self.n_tickers = n_tickers
+        self.window = window
+        dims = [window] + list(factor_hls)
+        layers = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i+1]))
+            if i != len(dims) - 2:
+                layers.append(nn.ReLU())
+
+        self.shared_mlp = nn.Sequential(*layers)
+        self.B = nn.Linear(dims[-1], n_tickers, bias=False) # no bias on last layer (factor head to expected returns is linear)
+    def forward(self, x):
+        # x is (ticker1(t-n), ticker1(t-n+1),...,ticker2(t-n), ticker2(t-n+2),...)
+        batch_size = x.shape[0]
+        x = x.view(batch_size, self.n_tickers, self.window) # (batch, n_tickers, window)
+        factors = self.shared_mlp(x).mean(dim=1) # (batch, factors)
+        out = self.B(factors) # (batch, tickers)
+        return out, factors
+
+def make_ml_statarb_strategy(market_data, ticker_to_idx, feature_to_idx, training_fraction=0.8):
+    n_tickers = len(ticker_to_idx)
+    window = 10
+    lr = 1e-3
+    weight_decay = 1e-4
+    epochs = 10000000
+    display_every = 100
+
+    model = StatArbModel(n_tickers=n_tickers, window=window, factor_hls=(32, 4))
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    # make input data
+    close_data = market_data[:, :, feature_to_idx["Close"]]
+    log_returns = np.log(close_data[1:] / close_data[:-1])
+    train_idx = int(log_returns.shape[0]*training_fraction)
+    mean = np.mean(log_returns[:train_idx], axis=0)
+    std = np.std(log_returns[:train_idx], axis=0) + 1e-3
+    log_returns = (log_returns - mean) / std # normalize
+
+    input_data = np.zeros((len(close_data) - window - 1, n_tickers*window))
+    for t in range(input_data.shape[0]):
+        window_slice = log_returns[t:t + window].T
+        input_data[t] = window_slice.flatten() # (ticker1(t-n), ticker1(t-n+1),...,ticker2(t-n), ticker2(t-n+2),...)
+    input_data = torch.tensor(input_data, dtype=torch.float32)
+    target_data = torch.tensor(log_returns[window:], dtype=torch.float32)
+
+    train_idx = int(input_data.shape[0]*training_fraction)
+    training_data = input_data[:train_idx]
+    training_targets = target_data[:train_idx]
+    test_data = input_data[train_idx:]
+    test_targets = target_data[train_idx:]
+
+    lambda_fac_slow = 0.1
+    lambda_fac_ortho = 0.05
+    lambda_res_var = 0.1
+    lambda_res_orhto = 0.05
+    def loss(preds, factors, targets):
+        loss_mse = F.mse_loss(preds, targets)
+        slow_factors_reg = F.mse_loss(factors[1:] - factors[:-1], torch.zeros_like(factors[1:])) # factors should be slow moving
+        residuals = preds - targets
+        res_var_reg = residuals.var(dim=0, unbiased=False).mean() # residuals should have low variance; be anamolous
+
+        # encourage factors to be orthogonal
+        T, K = factors.shape
+        C = (factors.T @ factors) / T
+        I = torch.eye(K)
+        fac_ortho_reg = ((C**2)*(1 - I)).sum() / (K*(K-1))
+
+        # encourage residuals to be orthogonal
+        T, K = residuals.shape
+        C = (residuals.T @ residuals) / T
+        I = torch.eye(K)
+        res_ortho_reg = ((C**2)*(1 - I)).sum() / (K*(K-1))
+        # res_norm = residuals / (residuals.std(dim=0, keepdim=True) + 1e-6)
+        # C = (res_norm.T @ res_norm) / T
+        # res_ortho_reg = ((C**2) * (1 - I)).mean()
+
+        # # normalize residuals across time
+        # res_norm = residuals / (residuals.std(dim=0, keepdim=True) + 1e-6)  # shape (T, K)
+
+        # # covariance / correlation matrix
+        # C = (res_norm.T @ res_norm) / T
+        # res_ortho_reg = ((C**2) * (1 - torch.eye(K, device=residuals.device))).mean()
+
+        return loss_mse + lambda_fac_slow*slow_factors_reg + lambda_res_var*res_var_reg + lambda_fac_ortho*fac_ortho_reg + lambda_res_orhto*res_ortho_reg
+    
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        preds, factors = model(training_data)
+        train_loss = loss(preds, factors, training_targets)
+        train_loss.backward()
+        optimizer.step()
+
+        if epoch % display_every == 0:
+            # with torch.no_grad():
+            #     preds, factors = model(training_data)
+            #     residuals = preds - training_targets
+            #     residuals_np = residuals.numpy()  # shape (batch, n_tickers)
+            #     col1 = residuals_np[:, 0]
+            #     col2 = residuals_np[:, 1]
+            #     corr = np.corrcoef(col1, col2)[0, 1]
+            #     print("Factor std:", factors.std(dim=0))
+            #     print("Residual std:", residuals.std(dim=0))
+            #     print("Residual correlation:", corr)
+
+            with torch.no_grad():
+                test_preds, test_factors = model(test_data)
+                factor_var = test_factors.var(dim=0)
+                test_loss = loss(test_preds, test_factors, test_targets)
+                print(f"Epoch {epoch}, Train Loss: {train_loss.item():.6f}, Test Loss: {test_loss.item():.6f}")#, Factor Var: {factor_var}")
