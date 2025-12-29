@@ -104,11 +104,11 @@ def format_yfinance_data(tickers, period):
     feature_to_idx = {feature: i for i, feature in enumerate(features)}
     return X, ticker_to_idx, feature_to_idx
 
-tickers = ["AAPL", "MSFT", "GOOG", "NVDA", "META"]
+tickers = ["AAPL", "MSFT", "GOOG", "NVDA", "META", "AMZN", "TSLA"]
 
 years_held_out = 4
 
-market_data, ticker_to_idx, feature_to_idx = format_yfinance_data(tickers, "20y")[-252*years_held_out:]
+market_data, ticker_to_idx, feature_to_idx = format_yfinance_data(tickers, "8y")[-252*years_held_out:]
 
 training_fraction = 0.8
 
