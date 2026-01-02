@@ -23,14 +23,14 @@ class SVDDModel(nn.Module):
     def forward(self, x, add_noise=False):
         # noise for smoother gradients in training
         if add_noise: 
-            std = 0.01
+            std = 1e-3
             alpha = 0.9
         else:
             std = 0
             alpha = 1
         x = x + torch.randn_like(x)*std
         for layer in self.fcs:
-            x = F.softplus(layer(x)*alpha)
+            x = F.relu(layer(x))
         return x
     
 
@@ -77,12 +77,12 @@ def train_svdd(market_data, feature_to_idx, window=5, training_fraction = 0.8):
     emb_dim = 8
     
     batch_size = 64
-    hidden_dims = (16,)
+    hidden_dims = (16,8)
     lr = 1e-3
     weight_decay = 1e-4
     lambda_jacobian = 0.1
-    epochs = 20
-    display_every = 19
+    epochs = 40
+    display_every = 100000
 
     eps = 1e-3
 
@@ -93,9 +93,11 @@ def train_svdd(market_data, feature_to_idx, window=5, training_fraction = 0.8):
     train_idx = int(len(log_returns)*training_fraction)
     log_returns_mean = np.mean(log_returns[:train_idx], axis=0)
     log_returns_std = np.std(log_returns[:train_idx], axis=0) + eps
+    log_returns_normalized = (log_returns - log_returns_mean) / log_returns_std
     X = []
-    for i in range(len(close_data) - window):
-        X.append(make_svdd_input(log_returns[i:i + window + 1], log_returns_mean, log_returns_std))
+    for i in range(len(close_data) - window - 1):
+        X.append(log_returns_normalized[i:i + window + 1].T.flatten())
+        # X.append(make_svdd_input(log_returns[i:i + window + 1], log_returns_mean, log_returns_std))
     X = torch.tensor(X, dtype=torch.float32)
 
     training_data = X[:train_idx]
@@ -125,7 +127,7 @@ def train_svdd(market_data, feature_to_idx, window=5, training_fraction = 0.8):
 
         if epoch % display_every == 0:
             optimizer.zero_grad()
-            z = model(test_data, add_noise=True)
+            z = model(test_data)
             test_loss = criterion(z, x=test_data)
             print(f"Epoch {epoch}, Loss: {loss.item():.6f}, Test Loss: {test_loss.item():.6f}")
 
@@ -140,16 +142,38 @@ def make_svdd_strategy(market_data, ticker_to_idx, feature_to_idx, training_frac
         if market_data.shape[0] <= window + 1:
             return diversify(capital_allocation, market_data, ticker_to_idx, feature_to_idx)
         log_returns = np.log(market_data[1:, :, feature_to_idx["Close"]] / market_data[:-1, :, feature_to_idx["Close"]])
-        x = torch.tensor(make_svdd_input(log_returns[-window - 1:], log_returns_mean, log_returns_std), dtype=torch.float32)
+        log_returns_normalized = (log_returns - log_returns_mean) / log_returns_std
+        x = torch.tensor(log_returns_normalized[-window-1:].T.flatten(), dtype=torch.float32)
+        # x = torch.tensor(make_svdd_input(log_returns[-window - 1:], log_returns_mean, log_returns_std), dtype=torch.float32)
 
-        x.requires_grad = True
-        x.retain_grad()
         z = model(x.unsqueeze(0))
         score = ((z - c)**2).sum()
-        model.zero_grad()
-        score.backward()
-        grad = x.grad[:len(x)//2].detach().squeeze(0)
-        fractions = torch.clamp(-grad[:grad.shape[0]], min=0)
+
+        h = 1e-3
+        K = 16
+        gradient = torch.zeros(len(capital_allocation))
+
+        for _ in range(K):
+            u = torch.randn_like(gradient)
+            u = u / (u.norm() + 1e-8)
+            pu = F.pad(u, (x.shape[0] - gradient.shape[0], 0))
+
+            z1 = model((x + h*pu).unsqueeze(0))
+            z2 = model((x - h*pu).unsqueeze(0))
+
+            score1 = ((z1 - c)**2).sum()
+            score2 = ((z2 - c)**2).sum()
+
+            gradient += (score1 - score2) / (2*h) * u
+
+        gradient /= K
+
+        # fractions = torch.tensor(fractions, dtype=torch.float32)
+        # fractions = torch.clamp(fractions, min=0)
+        # model.zero_grad()
+        # score.backward()
+        # grad = x.grad[:len(x)//2].detach().squeeze(0)
+        fractions = torch.clamp(-gradient, min=0)
         if fractions.sum() == 0:
             fractions = torch.ones_like(fractions)
         fractions /= fractions.sum()
@@ -408,6 +432,8 @@ class StatArbConv(nn.Module):
         y = self.B(f)
 
         return y, f
+    
+
 
 
 def make_ml_statarb_strategy(market_data, ticker_to_idx, feature_to_idx, training_fraction=0.8):

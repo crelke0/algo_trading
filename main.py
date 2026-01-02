@@ -34,23 +34,31 @@ def engine(strategy, market_data, ticker_to_idx, feature_to_idx):
 
     return returns, equity_curve
 
-def monte_carlo_simulation(make_strategy, market_data, ticker_to_idx, feature_to_idx, training_fraction=0.8, num_simulations=1000):
+def monte_carlo_simulation(make_strategy, market_data, ticker_to_idx, feature_to_idx, training_fraction=0.8, num_simulations=1000, retrain=1):
     test_idx = int(len(market_data)*training_fraction)
     
+    best_sharpe = 0
+    for _ in range(retrain):
+        strategy = make_strategy(market_data, ticker_to_idx, feature_to_idx, training_fraction=training_fraction)
+        actual_returns, _ = engine(strategy, market_data[test_idx:], ticker_to_idx, feature_to_idx)
+        actual_sharpe = calculate_sharpe_ratio(actual_returns)
+        best_sharpe = max(best_sharpe, actual_sharpe)
+    print(f"Best Sharpe Ratio: {best_sharpe:.4f}")
+
     sharpe_ratios = []
-    strategy = make_strategy(market_data, ticker_to_idx, feature_to_idx, training_fraction=training_fraction)
-    actual_returns, _ = engine(strategy, market_data[test_idx:], ticker_to_idx, feature_to_idx)
-    actual_sharpe = calculate_sharpe_ratio(actual_returns)
-    print(f"Actual Sharpe Ratio: {actual_sharpe:.4f}")
     random_wins = 0
     for _ in range(num_simulations):
         permuted_data = permute_data(market_data, feature_to_idx)
-        strategy = make_strategy(permuted_data, ticker_to_idx, feature_to_idx, training_fraction=training_fraction)
-        returns, _ = engine(strategy, permuted_data[test_idx:], ticker_to_idx, feature_to_idx)
-        sharpe_ratio = calculate_sharpe_ratio(returns)
-        if sharpe_ratio >= actual_sharpe:
+        best_sharpe = 0
+        for _ in range(retrain):
+            strategy = make_strategy(permuted_data, ticker_to_idx, feature_to_idx, training_fraction=training_fraction)
+            returns, _ = engine(strategy, permuted_data[test_idx:], ticker_to_idx, feature_to_idx)
+            sharpe_ratio = calculate_sharpe_ratio(returns)
+            best_sharpe = max(best_sharpe, sharpe_ratio)
+        print(best_sharpe)
+        if best_sharpe >= actual_sharpe:
             random_wins += 1
-        sharpe_ratios.append(sharpe_ratio)
+        sharpe_ratios.append(best_sharpe)
     p_value = random_wins / num_simulations
     mean = np.mean(sharpe_ratios)
     std = np.std(sharpe_ratios)
@@ -108,8 +116,12 @@ tickers = ["AAPL", "MSFT", "GOOG", "NVDA", "META", "AMZN", "TSLA"]
 
 years_held_out = 4
 
-market_data, ticker_to_idx, feature_to_idx = format_yfinance_data(tickers, "8y")[-252*years_held_out:]
+market_data, ticker_to_idx, feature_to_idx = format_yfinance_data(tickers, "10y")[-252*years_held_out:]
 
 training_fraction = 0.8
 
-strategies.make_ml_statarb_strategy(market_data, ticker_to_idx, feature_to_idx, training_fraction=training_fraction)
+p_value, mean, std = monte_carlo_simulation(strategies.make_svdd_strategy, market_data, ticker_to_idx, feature_to_idx, training_fraction, 100, retrain=20)
+print(p_value, mean, std)
+# strategy = strategies.make_svdd_strategy(market_data, ticker_to_idx, feature_to_idx, training_fraction)
+# returns, equity_curve = engine(strategy, market_data[int(len(market_data)*training_fraction):], ticker_to_idx, feature_to_idx)
+# print(calculate_sharpe_ratio(returns))
