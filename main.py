@@ -44,10 +44,10 @@ def monte_carlo_simulation(make_strategy, market_data, ticker_to_idx, feature_to
         actual_sharpe = calculate_sharpe_ratio(actual_returns)
         best_sharpe = max(best_sharpe, actual_sharpe)
     print(f"Best Sharpe Ratio: {best_sharpe:.4f}")
-
+    actual_sharpe = best_sharpe
     sharpe_ratios = []
     random_wins = 0
-    for _ in range(num_simulations):
+    for i in range(num_simulations):
         permuted_data = permute_data(market_data, feature_to_idx)
         best_sharpe = 0
         for _ in range(retrain):
@@ -55,10 +55,14 @@ def monte_carlo_simulation(make_strategy, market_data, ticker_to_idx, feature_to
             returns, _ = engine(strategy, permuted_data[test_idx:], ticker_to_idx, feature_to_idx)
             sharpe_ratio = calculate_sharpe_ratio(returns)
             best_sharpe = max(best_sharpe, sharpe_ratio)
-        print(best_sharpe)
         if best_sharpe >= actual_sharpe:
             random_wins += 1
+
         sharpe_ratios.append(best_sharpe)
+        p_value = random_wins / (i + 1)
+        mean = np.mean(sharpe_ratios)
+        std = np.std(sharpe_ratios)
+        print(p_value, mean, std)
     p_value = random_wins / num_simulations
     mean = np.mean(sharpe_ratios)
     std = np.std(sharpe_ratios)
@@ -112,16 +116,14 @@ def format_yfinance_data(tickers, period):
     feature_to_idx = {feature: i for i, feature in enumerate(features)}
     return X, ticker_to_idx, feature_to_idx
 
-tickers = ["AAPL", "MSFT", "GOOG", "NVDA", "META", "AMZN", "TSLA"]
+tickers = ["AAPL", "MSFT", "GOOG", "NVDA", "META", "AMZN", "TSLA", "SPY", "XLK"]
 
 years_held_out = 4
 
-market_data, ticker_to_idx, feature_to_idx = format_yfinance_data(tickers, "10y")[-252*years_held_out:]
+market_data, ticker_to_idx, feature_to_idx = format_yfinance_data(tickers, "6y")
+market_data = market_data[:-252*years_held_out]
+
 
 training_fraction = 0.8
 
-p_value, mean, std = monte_carlo_simulation(strategies.make_svdd_strategy, market_data, ticker_to_idx, feature_to_idx, training_fraction, 100, retrain=20)
-print(p_value, mean, std)
-# strategy = strategies.make_svdd_strategy(market_data, ticker_to_idx, feature_to_idx, training_fraction)
-# returns, equity_curve = engine(strategy, market_data[int(len(market_data)*training_fraction):], ticker_to_idx, feature_to_idx)
-# print(calculate_sharpe_ratio(returns))
+strategies.make_classical_statarb_strategy(market_data, ticker_to_idx, feature_to_idx, training_fraction)
