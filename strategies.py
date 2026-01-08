@@ -8,6 +8,67 @@ def diversify(capital_allocation, market_data, ticker_to_idx, feature_to_idx):
     capital_allocation = np.full_like(capital_allocation, 1.0 / len(capital_allocation))
     return capital_allocation
 
+def radial_norm_loss(x, z, k, c):
+    """
+    x: returns, shape (time, n_features)
+    z: embeddings, shape (time, embedding_dim)
+    c: center, shape (embedding_dim,)
+    k: proportionality constant
+    """
+    dz = z[1:] - z[:-1]  # (time-1, embedding_dim)
+    dc = (c - z[:-1]) / (c - z[:-1]).norm(dim=1, keepdim=True)  # radial unit vector
+
+    r = (dz * dc).sum(dim=1)           # dot product along embedding dim
+    r = F.relu(r)                       # only care about movement away from center
+
+    delta_x_norm = (x[1:] - x[:-1]).norm(dim=1)  # norm of return differences
+    dz_norm = dz.norm(dim=1)                        # norm of embedding differences
+
+    # Weighted MSE along radial direction
+    loss = ((delta_x_norm - k * dz_norm)**2 * r).mean()
+    return loss
+
+
+
+class CausalConv1d(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size, bias=True):
+        super().__init__()
+        self.k = kernel_size
+        self.conv = nn.Conv1d(
+            in_ch, out_ch, kernel_size,
+            padding=0, bias=bias
+        )
+
+    def forward(self, x):
+        # x: (batch, channels, time)
+        x = F.pad(x, (self.k - 1, 0))
+        return self.conv(x)
+
+class ConvSVDDNet(nn.Module):
+    def __init__(self, n_tickers, window, emb_dim=8):
+        super().__init__()
+        self.n_tickers = n_tickers
+        self.window = window
+
+        self.conv1 = CausalConv1d(n_tickers, 4, kernel_size=3, bias=False)
+        self.conv2 = CausalConv1d(4, 4, kernel_size=3, bias=False)
+
+        self.fc = nn.Linear(4 * window, emb_dim, bias=False)
+
+    def forward(self, x):
+        # x: (batch, n_tickers*(window+1))
+        batch_size = x.shape[0]
+
+        # reshape to (batch, channels=n_tickers, time=window+1)
+        x = x.view(batch_size, self.n_tickers, self.window)
+
+        x = F.softplus(self.conv1(x))
+        x = F.softplus(self.conv2(x))
+
+        # flatten over channels*time
+        x = x.flatten(1)
+
+        return self.fc(x)
 
 
 
@@ -30,7 +91,7 @@ class SVDDModel(nn.Module):
             alpha = 1
         x = x + torch.randn_like(x)*std
         for layer in self.fcs:
-            x = F.relu(layer(x))
+            x = F.softplus(layer(x))
         return x
     
 
@@ -80,9 +141,13 @@ def train_svdd(market_data, feature_to_idx, window=5, training_fraction = 0.8):
     hidden_dims = (16,8)
     lr = 1e-3
     weight_decay = 1e-4
-    lambda_jacobian = 0.1
-    epochs = 40
-    display_every = 100000
+    lambda_jacobian = 0.0
+    radial_norm_loss_lambda = 0.5
+    epochs = 51
+    display_every = 50
+
+    lambda_neg = 0.2
+    margin = 0.01
 
     eps = 1e-3
 
@@ -95,22 +160,36 @@ def train_svdd(market_data, feature_to_idx, window=5, training_fraction = 0.8):
     log_returns_std = np.std(log_returns[:train_idx], axis=0) + eps
     log_returns_normalized = (log_returns - log_returns_mean) / log_returns_std
     X = []
-    for i in range(len(close_data) - window - 1):
-        X.append(log_returns_normalized[i:i + window + 1].T.flatten())
-        # X.append(make_svdd_input(log_returns[i:i + window + 1], log_returns_mean, log_returns_std))
+    negatives = []
+    for i in range(len(close_data) - window):
+        window_returns = log_returns_normalized[i:i + window]
+        shuffled = window_returns[np.random.permutation(window)]
+        negatives.append(shuffled.T.flatten())
+        X.append(window_returns.T.flatten())
     X = torch.tensor(X, dtype=torch.float32)
+    negatives = torch.tensor(negatives, dtype=torch.float32)
 
     training_data = X[:train_idx]
     test_data = X[train_idx:]
 
     model = SVDDModel(in_dim=X.shape[1], hidden_dim=hidden_dims, emb_dim=emb_dim)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # model = ConvSVDDNet(market_data.shape[1], window=window, emb_dim=emb_dim)
+    
 
     # Initialize center c
     with torch.no_grad():
         z = model(training_data)
         c = z.mean(dim=0)
         c[torch.abs(c) < eps] = eps
+        d = ((z - c)**2).sum(dim=1)
+        # print(d.mean(), d.quantile(0.9), d.quantile(0.95))
+
+        
+    # log_k = torch.nn.Parameter(torch.tensor(1.0))
+    # log_k.requires_grad = True
+
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     criterion = SmoothSVDDLoss(c=c, lambda_jacobian=lambda_jacobian)
 
@@ -120,21 +199,30 @@ def train_svdd(market_data, feature_to_idx, window=5, training_fraction = 0.8):
             batch = shuffled[i:min(i+batch_size, len(training_data))]
             batch.requires_grad = True
             optimizer.zero_grad()
-            z = model(batch, add_noise=True)
-            loss = criterion(z, x=batch)
+            z_pos = model(batch)#, add_noise=True)
+            # k = F.softplus(log_k)
+            # loss = criterion(z)# + radial_norm_loss(batch, z, k, c) * radial_norm_loss_lambda
+            z_neg = model(negatives)
+
+            dist_pos = ((z_pos - c)**2).sum(dim=1)
+            dist_neg = ((z_neg - c)**2).sum(dim=1)
+
+            loss = dist_pos.mean() + lambda_neg * F.relu(margin - dist_neg).mean()
+
+            
             loss.backward()
             optimizer.step()
 
         if epoch % display_every == 0:
-            optimizer.zero_grad()
-            z = model(test_data)
-            test_loss = criterion(z, x=test_data)
+            z_test = model(test_data)
+            # k_test = k.detach()
+            test_loss = criterion(z_test)# + radial_norm_loss(test_data, z_test, k_test, c) * radial_norm_loss_lambda
             print(f"Epoch {epoch}, Loss: {loss.item():.6f}, Test Loss: {test_loss.item():.6f}")
 
     return model, c, log_returns_mean, log_returns_std
 
 def make_svdd_strategy(market_data, ticker_to_idx, feature_to_idx, training_fraction=0.8):
-    window = 5
+    window = 7
     eps = 1e-3
     model, c, log_returns_mean, log_returns_std = train_svdd(market_data, feature_to_idx, window=window, training_fraction=training_fraction)
 
@@ -142,9 +230,9 @@ def make_svdd_strategy(market_data, ticker_to_idx, feature_to_idx, training_frac
         if market_data.shape[0] <= window + 1:
             return diversify(capital_allocation, market_data, ticker_to_idx, feature_to_idx)
         log_returns = np.log(market_data[1:, :, feature_to_idx["Close"]] / market_data[:-1, :, feature_to_idx["Close"]])
+        # x = torch.tensor((log_returns - log_returns.mean()) / log_returns.std(), dtype=torch.float32)
         log_returns_normalized = (log_returns - log_returns_mean) / log_returns_std
-        x = torch.tensor(log_returns_normalized[-window-1:].T.flatten(), dtype=torch.float32)
-        # x = torch.tensor(make_svdd_input(log_returns[-window - 1:], log_returns_mean, log_returns_std), dtype=torch.float32)
+        x = torch.tensor(log_returns_normalized[-window:].T.flatten(), dtype=torch.float32)
 
         z = model(x.unsqueeze(0))
         score = ((z - c)**2).sum()
@@ -526,3 +614,88 @@ def make_ml_statarb_strategy(market_data, ticker_to_idx, feature_to_idx, trainin
                 factor_var = test_factors.var(dim=0)
                 test_loss = loss(test_preds, test_factors, test_targets)
                 print(f"Epoch {epoch}, Train Loss: {train_loss.item():.6f}, Test Loss: {test_loss.item():.6f}")#, Factor Var: {factor_var}")
+
+def classical_stat_arb_strategy(capital_allocation, market_data, ticker_to_idx, feature_to_idx):
+    window = 10
+    training_period = 252
+
+    close_data = market_data[:, :, feature_to_idx["Close"]]
+    log_returns = torch.tensor(np.log(close_data[1:] / close_data[:-1]))
+
+    factor_indices = np.array([ticker_to_idx["SPY"], ticker_to_idx["XLK"]])
+    trading_indices = np.setdiff1d(np.arange(log_returns.shape[1]), factor_indices)
+
+    if market_data.shape[0] < 60:
+        n = trading_indices.shape[0]
+        return [1/n]*n + [0]*factor_indices.shape[0]
+
+    F = log_returns[:, factor_indices]
+    R = log_returns[:, trading_indices]
+
+    B = torch.linalg.lstsq(F[:training_period], R[:training_period]).solution
+
+    eps = (R - F @ B).numpy()
+    eps_window = eps[-window:]
+    mean = eps_window.mean(axis=0)
+    std = eps_window.std(axis=0)
+    z_score = (eps[-1] - mean) / std
+
+    # portfolio creation
+    threshold = 2.0
+    filtered_z_score = -np.where(np.abs(z_score) > threshold, z_score, 0)
+
+    # project filtered_z_score onto factor-neutral subspace
+    B_np = B.numpy().T
+    w_factor_neutral = filtered_z_score - B_np @ np.linalg.inv(B_np.T @ B_np) @ (B_np.T @ filtered_z_score)
+    # P = np.eye(B.shape[0]) - B @ np.linalg.inv(B.T @ B) @ B.T
+    # w_factor_neutral = P @ filtered_z_score
+
+    # enforce dollar neutrality
+    w = w_factor_neutral - w_factor_neutral.mean()
+
+    allocation = np.zeros(len(capital_allocation))
+    allocation[trading_indices] = w
+
+    return allocation.tolist()
+
+
+def long_only_stat_arb_strategy(capital_allocation, market_data, ticker_to_idx, feature_to_idx):
+    window = 10
+    training_period = 60
+
+    close_data = market_data[:, :, feature_to_idx["Close"]]
+    log_returns = torch.tensor(np.log(close_data[1:] / close_data[:-1]))
+
+    factor_indices = np.array([ticker_to_idx["SPY"], ticker_to_idx["XLK"]])
+    trading_indices = np.setdiff1d(np.arange(log_returns.shape[1]), factor_indices)
+
+    if market_data.shape[0] < 60:
+        n = trading_indices.shape[0]
+        return [1/n]*n + [0]*factor_indices.shape[0]
+
+    F = log_returns[:, factor_indices]
+    R = log_returns[:, trading_indices]
+
+    B = torch.linalg.lstsq(F[:training_period], R[:training_period]).solution
+
+    eps = (R - F @ B).numpy()
+    eps_window = eps[-window:]
+    mean = eps_window.mean(axis=0)
+    std = eps_window.std(axis=0)
+    z_score = (eps[-1] - mean) / std
+
+    # portfolio creation
+    threshold = 1.0
+    filtered_z_score = -np.clip(np.where(np.abs(z_score) > threshold, z_score, 0), a_min=None, a_max=0)
+
+    if filtered_z_score.sum() == 0:
+        w = np.ones(filtered_z_score.shape[0])
+    else:
+        w = filtered_z_score
+
+    w = w / w.sum()
+
+    allocation = np.zeros(len(capital_allocation))
+    allocation[trading_indices] = w
+
+    return allocation.tolist()

@@ -120,10 +120,23 @@ tickers = ["AAPL", "MSFT", "GOOG", "NVDA", "META", "AMZN", "TSLA", "SPY", "XLK"]
 
 years_held_out = 4
 
-market_data, ticker_to_idx, feature_to_idx = format_yfinance_data(tickers, "6y")
+market_data, ticker_to_idx, feature_to_idx = format_yfinance_data(tickers, "10y")
 market_data = market_data[:-252*years_held_out]
-
 
 training_fraction = 0.8
 
-strategies.make_classical_statarb_strategy(market_data, ticker_to_idx, feature_to_idx, training_fraction)
+strategy = strategies.long_only_stat_arb_strategy
+returns, equity_curve = engine(strategy, market_data, ticker_to_idx, feature_to_idx)
+sharpe = calculate_sharpe_ratio(returns)
+print(sharpe)
+
+import matplotlib.pyplot as plt
+plt.figure(figsize=(10,4))
+plt.plot(equity_curve, label="strategy equity")
+
+returns, equity_curve = engine(strategies.diversify, market_data, ticker_to_idx, feature_to_idx)
+sharpe = calculate_sharpe_ratio(returns)
+plt.plot(equity_curve, label="diversified equity")
+print(sharpe)
+
+plt.show()
