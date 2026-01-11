@@ -658,10 +658,9 @@ def classical_stat_arb_strategy(capital_allocation, market_data, ticker_to_idx, 
 
     return allocation.tolist()
 
-
 def long_only_stat_arb_strategy(capital_allocation, market_data, ticker_to_idx, feature_to_idx):
     window = 10
-    training_period = 60
+    training_period = 30
 
     close_data = market_data[:, :, feature_to_idx["Close"]]
     log_returns = torch.tensor(np.log(close_data[1:] / close_data[:-1]))
@@ -685,13 +684,13 @@ def long_only_stat_arb_strategy(capital_allocation, market_data, ticker_to_idx, 
     z_score = (eps[-1] - mean) / std
 
     # portfolio creation
-    threshold = 1.0
-    filtered_z_score = -np.clip(np.where(np.abs(z_score) > threshold, z_score, 0), a_min=None, a_max=0)
+    threshold = 0.25
+    filtered_z_score = np.clip(np.where(np.abs(z_score) > threshold, z_score, 0), a_min=None, a_max=0)
 
     if filtered_z_score.sum() == 0:
         w = np.ones(filtered_z_score.shape[0])
     else:
-        w = filtered_z_score
+        w = -filtered_z_score
 
     w = w / w.sum()
 
@@ -699,3 +698,249 @@ def long_only_stat_arb_strategy(capital_allocation, market_data, ticker_to_idx, 
     allocation[trading_indices] = w
 
     return allocation.tolist()
+
+
+def make_MLP_stat_arb(market_data, ticker_to_idx, feature_to_idx, training_fraction=0.8):
+    window = 5
+    n_tickers = len(ticker_to_idx)
+
+    # -------
+    # params
+    # -------
+    hidden_dims = (35,)
+    lr = 1e-3
+    weight_decay = 1e-4
+    epochs = 10000
+    display_every = 500
+
+    # ------------
+    # make network
+    # ------------
+    dims = [window*n_tickers] + list(hidden_dims) + [n_tickers]
+    layers = []
+    for i in range(len(dims) - 1):
+        layers.append(nn.Linear(dims[i], dims[i+1]))
+        if i != len(dims) - 2:
+            layers.append(nn.GELU())
+    network = nn.Sequential(*layers)
+    
+    # -----------
+    # make inputs
+    # -----------
+    log_returns = np.log(market_data[1:, :, feature_to_idx["Close"]]/market_data[:-1, :, feature_to_idx["Close"]])
+
+    # z_score normalization
+    # z_score_window = 60
+    # z_log_returns = np.zeros_like(log_returns[z_score_window:])
+    # for i in range(z_log_returns.shape[0]):
+    #     window_slice = log_returns[i:i+z_score_window]
+    #     mean = window_slice.mean(axis=0)
+    #     std = window_slice.std(axis=0)
+    #     z_log_returns[i] = (log_returns[i+z_score_window]-mean)/std
+    z_log_returns = log_returns
+
+    # making windows
+    data = np.zeros((z_log_returns.shape[0] - window, window*n_tickers))
+    for i in range(data.shape[0]):
+        window_slice = z_log_returns[i:i+window].flatten()
+        data[i] = window_slice
+
+    data = torch.tensor(data, dtype=torch.float32)
+    test_idx = int(training_fraction*z_log_returns.shape[0])
+
+    # ---------
+    # training
+    # ---------
+    optimizer = torch.optim.Adam(network.parameters(), lr=lr, weight_decay=weight_decay)
+    
+    def compute_loss(X, Z):
+        y = X[:, -n_tickers:]
+        r = y - Z
+
+        mse = F.mse_loss(Z, y)
+        mae = F.l1_loss(Z, y)
+
+        # lag-1 residual autocorrelation (correlation, not regression)
+        def lag1_corr(x):
+            x0 = x[:-1]
+            x1 = x[1:]
+            x0 = (x0 - x0.mean()) / (x0.std() + 1e-6)
+            x1 = (x1 - x1.mean()) / (x1.std() + 1e-6)
+            return (x0 * x1).mean()
+
+        autocorr_loss = (lag1_corr(r) + 1.0)**2
+
+        smooth_loss = (Z[1:] - Z[:-1]).abs().mean()
+
+        loss_curv = ((r[2:] - 2*r[1:-1] + r[:-2])**2).mean()
+
+
+        return (
+            mse
+            # + 0.5 * mae
+            + 1.0 * autocorr_loss
+            + 1.0 * smooth_loss
+            + 2.0 * loss_curv
+        )
+
+    def _safe_corr(a, b):
+        a = np.asarray(a)
+        b = np.asarray(b)
+        if a.size < 2:
+            return np.nan
+        sa = np.std(a)
+        sb = np.std(b)
+        if sa == 0 or sb == 0:
+            return np.nan
+        return float(np.corrcoef(a, b)[0, 1])
+
+    def _ar1_phi(x):
+        # x: 1d array
+        if x.size < 2:
+            return np.nan
+        x_lag = x[:-1] - x[:-1].mean()
+        x_nxt = x[1:]  - x[1:].mean()
+        denom = np.sum(x_lag**2)
+        if denom == 0:
+            return np.nan
+        return float(np.sum(x_lag * x_nxt) / denom)
+
+    def _halflife_from_phi(phi):
+        # envelope half-life in days for |phi|<1
+        if phi is None or not np.isfinite(phi):
+            return np.nan
+        ap = abs(phi)
+        if ap <= 0:
+            return 0.0
+        if ap >= 1:
+            return np.inf
+        return float(np.log(2) / (-np.log(ap)))
+
+    @torch.no_grad()
+    def compute_residual_stats(X, Z):
+        """
+        X: [T, ...] includes today's returns in last n_tickers columns
+        Z: [T, n_tickers] model output for today's returns
+        """
+        y = X[:, -n_tickers:]                    # [T, N]
+        r = (y - Z).detach().cpu().numpy()       # residuals [T, N]
+        y_np = y.detach().cpu().numpy()
+
+        T, N = r.shape
+        stats_list = []
+
+        for i in range(N):
+            res = r[:, i]
+            y_true = y_np[:, i]
+
+            # lag-1 autocorr (same as AR1 corr estimate)
+            rho = _safe_corr(res[1:], res[:-1])
+
+            # AR(1) phi and envelope half-life
+            phi = _ar1_phi(res)
+            hl = _halflife_from_phi(phi)
+
+            # variance of residual
+            var_res = float(np.var(res))
+
+            # corr(res, y) just as a leakage-style diagnostic (fine to keep)
+            corr_ry = _safe_corr(res, y_true)
+
+            # Proper R^2 of predicting y with Z (using residual)
+            y_demean = y_true - y_true.mean()
+            sst = float(np.sum(y_demean**2))
+            sse = float(np.sum(res**2))
+            r2 = float(1.0 - (sse / sst)) if sst > 0 else np.nan
+
+            # per-ticker next-day predictability (time-series)
+            pred_corr = _safe_corr(res[:-1], y_true[1:])
+
+            stats_list.append({
+                "residual_ac": float(rho),
+                "phi": float(phi) if np.isfinite(phi) else np.nan,
+                "residual_HL": float(hl),
+                "residual_var": float(var_res),
+                "corr_with_true": float(corr_ry),
+                "pred_corr": float(pred_corr),
+                "R2": float(r2),
+            })
+
+        # ---- Cross-sectional IC/IR (for how you actually trade) ----
+        # IC_t = corr_cs(residual_t, next_day_return_t)
+        # Here we use y_true shifted as "next day" proxy (make sure y_true aligns with your trading return)
+        ic_ts = []
+        for t in range(T - 1):
+            ic = _safe_corr(r[t, :], y_np[t + 1, :])
+            ic_ts.append(ic)
+        ic_ts = np.array(ic_ts, dtype=float)
+
+        ic_mean = float(np.nanmean(ic_ts))
+        ic_std = float(np.nanstd(ic_ts, ddof=1)) if np.sum(np.isfinite(ic_ts)) > 1 else np.nan
+        ir = float(ic_mean / ic_std) if ic_std and np.isfinite(ic_std) and ic_std > 0 else np.nan
+        ic_hit = float(np.nanmean(np.sign(ic_ts) == np.sign(ic_mean))) if np.isfinite(ic_mean) else np.nan
+
+        summary = {
+            "IC_mean": ic_mean,
+            "IC_std": ic_std,
+            "IR": ir,
+            "IC_hit_rate": ic_hit,
+            "IC_T": int(T - 1),
+        }
+
+        return stats_list, summary
+
+    
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+
+        Z = network(data[:test_idx])
+        loss = compute_loss(data[:test_idx], Z)
+
+        loss.backward()
+        optimizer.step()
+
+        # if epoch % display_every == 0:
+        if epoch == epochs-1:
+            with torch.no_grad():
+                Z_test = network(data[test_idx:])
+                test_loss = compute_loss(data[test_idx:], Z_test)
+                residuals = data[test_idx:, -n_tickers:] - Z_test
+                stats = compute_residual_stats(data[test_idx:], Z_test)
+            print(stats)
+            # print(f"Epoch: {epoch} | Training Loss: {loss.item():.6f} | Test Loss: {test_loss.item():.6f} | Residual Mean: {residuals.mean().item():.6f}, STD: {residuals.std().item():.6f}")
+    stats, _ = compute_residual_stats(data[:test_idx], Z)
+    acs = stats[-1]["residual_ac"]
+    
+
+    def strategy(capital_allocation, market_data, ticker_to_idx, feature_to_idx):
+        if(market_data.shape[0] <= window + 1):
+            return diversify(capital_allocation, market_data, ticker_to_idx, feature_to_idx)
+
+        log_returns = np.log(market_data[1:, :, feature_to_idx["Close"]]/market_data[:-1, :, feature_to_idx["Close"]])
+
+        data = np.zeros((log_returns.shape[0] - window, window*n_tickers))
+        for i in range(data.shape[0]):
+            window_slice = log_returns[i:i+window].flatten()
+            data[i] = window_slice
+
+        data = torch.tensor(data, dtype=torch.float32)
+
+        residuals = data[:, -n_tickers:] - network(data)
+        residuals = residuals.detach().numpy()
+        s = residuals - residuals.mean(axis=1, keepdims=True)
+        s = (s - s.mean(axis=0)) / (s.std(axis=0) + 0.0001)
+        s[s > 0.0] = 0.0
+        if np.mean(np.abs(s[-1])) == 0:
+            return np.zeros(n_tickers)
+        return -s[-1] / np.mean(np.abs(s[-1]))
+
+    return strategy
+
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(10,4))
+    # plt.plot(bucket_means)
+    # plt.plot(residuals - residuals.mean(axis=1, keepdims=True))
+    # plt.plot(pnl.mean(axis=1), label='PnL')
+    plt.plot(residuals - residuals.mean(axis=1, keepdims=True))
+    plt.show()
+

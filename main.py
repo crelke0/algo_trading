@@ -14,21 +14,20 @@ def calculate_sharpe_ratio(returns):
     return sharpe_ratio
 
 def engine(strategy, market_data, ticker_to_idx, feature_to_idx):
-    capital_allocation = [0.0]*len(ticker_to_idx)
+    w = np.zeros(len(ticker_to_idx))
     returns = []
     equity_curve = [1.0]
     for d in range(len(market_data) - 2):
-        capital_allocation = strategy(capital_allocation, market_data[:d + 1], ticker_to_idx, feature_to_idx)
-        uninvested = 1 - sum(capital_allocation)
-        if uninvested < -1e-6:
-            print(uninvested)
-            raise ValueError("Capital allocation values must sum to less than 1.")
+        w = strategy(w, market_data[:d + 1], ticker_to_idx, feature_to_idx)
+        gross = np.mean(np.abs(w))
+        if(gross > 1.001):
+            raise ValueError("Gross greater than 1")
 
         day_return = 0.0
-        for i in range(len(capital_allocation)):
+        for i in range(w.shape[0]):
             open_price1 = market_data[d + 1, i, feature_to_idx["Open"]]
             open_price2 = market_data[d + 2, i, feature_to_idx["Open"]]
-            day_return += capital_allocation[i]*(open_price2 / open_price1 - 1)
+            day_return += w[i]*(open_price2 / open_price1 - 1)
         returns.append(day_return)
         equity_curve.append(equity_curve[-1]*(1 + day_return))
 
@@ -37,7 +36,7 @@ def engine(strategy, market_data, ticker_to_idx, feature_to_idx):
 def monte_carlo_simulation(make_strategy, market_data, ticker_to_idx, feature_to_idx, training_fraction=0.8, num_simulations=1000, retrain=1):
     test_idx = int(len(market_data)*training_fraction)
     
-    best_sharpe = 0
+    best_sharpe = -float('inf')
     for _ in range(retrain):
         strategy = make_strategy(market_data, ticker_to_idx, feature_to_idx, training_fraction=training_fraction)
         actual_returns, _ = engine(strategy, market_data[test_idx:], ticker_to_idx, feature_to_idx)
@@ -49,7 +48,7 @@ def monte_carlo_simulation(make_strategy, market_data, ticker_to_idx, feature_to
     random_wins = 0
     for i in range(num_simulations):
         permuted_data = permute_data(market_data, feature_to_idx)
-        best_sharpe = 0
+        best_sharpe = -float('inf')
         for _ in range(retrain):
             strategy = make_strategy(permuted_data, ticker_to_idx, feature_to_idx, training_fraction=training_fraction)
             returns, _ = engine(strategy, permuted_data[test_idx:], ticker_to_idx, feature_to_idx)
@@ -116,27 +115,65 @@ def format_yfinance_data(tickers, period):
     feature_to_idx = {feature: i for i, feature in enumerate(features)}
     return X, ticker_to_idx, feature_to_idx
 
-tickers = ["AAPL", "MSFT", "GOOG", "NVDA", "META", "AMZN", "TSLA", "SPY", "XLK"]
+# tickers = ["AAPL", "MSFT", "GOOG", "NVDA", "META", "AMZN", "TSLA", "SPY", "XLK"]
+# tickers = ["AAPL", "MSFT", "GOOG", "NVDA", "SPY", "XLK"]
+tickers = ["AAPL", "MSFT", "GOOG", "NVDA", "META", "AMZN", "TSLA"]
+# tickers = [
+#     "AAPL","MSFT","GOOGL","AMZN","META","NVDA","TSLA","BRK-B","JPM","V",
+#     "UNH","HD","MA","XOM","LLY","PG","AVGO","COST","PEP","ADBE",
+#     "CRM","ABBV","KO","MRK","WMT","MCD","ACN","NFLX","INTC","CSCO",
+#     "PFE","TMO","ORCL","QCOM","AMGN","TXN","LIN","NEE","HON","UPS",
+#     "LOW","PM","IBM","AMD","RTX","INTU","SBUX","DE","BA","GE"
+# ]
 
 years_held_out = 4
 
 market_data, ticker_to_idx, feature_to_idx = format_yfinance_data(tickers, "10y")
 market_data = market_data[:-252*years_held_out]
 
-training_fraction = 0.8
+training_fraction=0.8
 
-strategy = strategies.long_only_stat_arb_strategy
-returns, equity_curve = engine(strategy, market_data, ticker_to_idx, feature_to_idx)
+test_idx = int(training_fraction*market_data.shape[0])
+
+strategy = strategies.make_MLP_stat_arb(market_data, ticker_to_idx, feature_to_idx, training_fraction=training_fraction)
+returns, equity_curve = engine(strategy, market_data[test_idx:], ticker_to_idx, feature_to_idx)
+sharpe = calculate_sharpe_ratio(returns)
+# monte_carlo_simulation(strategies.make_MLP_stat_arb, market_data, ticker_to_idx, feature_to_idx, 0.9, 1000, 1)
+print(sharpe)
+
+returns, equity_curve = engine(strategies.diversify, market_data[test_idx:], ticker_to_idx, feature_to_idx)
 sharpe = calculate_sharpe_ratio(returns)
 print(sharpe)
 
-import matplotlib.pyplot as plt
-plt.figure(figsize=(10,4))
-plt.plot(equity_curve, label="strategy equity")
 
-returns, equity_curve = engine(strategies.diversify, market_data, ticker_to_idx, feature_to_idx)
-sharpe = calculate_sharpe_ratio(returns)
-plt.plot(equity_curve, label="diversified equity")
-print(sharpe)
+# strategy = strategies.long_only_stat_arb_strategy
+# returns, equity_curve = engine(strategy, market_data, ticker_to_idx, feature_to_idx)
+# sharpe = calculate_sharpe_ratio(returns)
+# print(sharpe)
 
-plt.show()
+# import matplotlib.pyplot as plt
+# plt.figure(figsize=(10,4))
+# # plt.plot(np.array(equity_curve)*(sharpe/equity_curve[-1]), label="strategy equity")
+# plt.plot(equity_curve, label="strategy equity")
+
+
+# def diversify(capital_allocation, market_data, ticker_to_idx, feature_to_idx):
+#     factor_indices = np.array([ticker_to_idx["SPY"], ticker_to_idx["XLK"]])
+#     trading_indices = np.setdiff1d(np.arange(len(capital_allocation)), factor_indices)
+#     w = np.zeros(len(capital_allocation))
+#     w[trading_indices] = 1
+#     w /= w.sum()
+#     return w
+
+# returns, equity_curve = engine(diversify, market_data, ticker_to_idx, feature_to_idx)
+# sharpe = calculate_sharpe_ratio(returns)
+# # plt.plot(np.array(equity_curve)*(sharpe/equity_curve[-1]), label="diversified equity")
+# plt.plot(equity_curve, label="diversified equity")
+
+# print(sharpe)
+
+# plt.show()
+
+# # make_strat = lambda market_data, ticker_to_idx, feature_to_idx, training_fraction: strategies.long_only_stat_arb_strategy
+# # p_value, mean, std = monte_carlo_simulation(make_strat, market_data, ticker_to_idx, feature_to_idx, training_fraction=0.0, num_simulations=1000)
+# # print(p_value, mean, std)
