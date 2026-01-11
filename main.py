@@ -2,6 +2,54 @@ import numpy as np
 import yfinance as yf
 import strategies
 
+def regression_diagnostics(r_strat, r_base, annualize=252):
+    r_strat = np.asarray(r_strat, dtype=float)
+    r_base  = np.asarray(r_base, dtype=float)
+
+    # Drop NaNs / infs and enforce equal length
+    m = np.isfinite(r_strat) & np.isfinite(r_base)
+    r_strat = r_strat[m]
+    r_base  = r_base[m]
+    assert len(r_strat) == len(r_base) and len(r_strat) > 5
+
+    # Basic stats
+    mu_s, mu_b = r_strat.mean(), r_base.mean()
+    sd_s, sd_b = r_strat.std(ddof=1), r_base.std(ddof=1)
+    corr = np.corrcoef(r_strat, r_base)[0, 1]
+
+    # OLS with intercept: r_strat = alpha + beta * r_base + u
+    X = np.column_stack([np.ones_like(r_base), r_base])
+    coef, *_ = np.linalg.lstsq(X, r_strat, rcond=None)
+    alpha, beta = coef
+
+    u = r_strat - (alpha + beta * r_base)
+
+    # Sharpe / IR (annualized)
+    sharpe_s = (mu_s / (sd_s + 1e-12)) * np.sqrt(annualize)
+    sharpe_b = (mu_b / (sd_b + 1e-12)) * np.sqrt(annualize)
+    ir_u     = (u.mean() / (u.std(ddof=1) + 1e-12)) * np.sqrt(annualize)
+
+    # Consistency check: beta should equal corr * sd_s/sd_b (when intercept included)
+    beta_from_corr = corr * (sd_s / (sd_b + 1e-12))
+
+    # R^2
+    ss_res = np.sum(u*u)
+    ss_tot = np.sum((r_strat - r_strat.mean())**2)
+    r2 = 1.0 - ss_res/(ss_tot + 1e-12)
+
+    out = dict(
+        n=len(r_strat),
+        corr=corr,
+        mean_strat=mu_s, std_strat=sd_s, sharpe_ann=sharpe_s,
+        mean_base=mu_b, std_base=sd_b, base_sharpe_ann=sharpe_b,
+        alpha_daily=alpha, alpha_ann=alpha*annualize,
+        beta=beta,
+        beta_from_corr=beta_from_corr,
+        r2=r2,
+        ir_resid_ann=ir_u
+    )
+    return out
+
 def calculate_sharpe_ratio(returns):
     returns_array = np.array(returns)
     mean_return = np.mean(returns_array)
@@ -136,44 +184,12 @@ training_fraction=0.8
 test_idx = int(training_fraction*market_data.shape[0])
 
 strategy = strategies.make_MLP_stat_arb(market_data, ticker_to_idx, feature_to_idx, training_fraction=training_fraction)
-returns, equity_curve = engine(strategy, market_data[test_idx:], ticker_to_idx, feature_to_idx)
-sharpe = calculate_sharpe_ratio(returns)
-# monte_carlo_simulation(strategies.make_MLP_stat_arb, market_data, ticker_to_idx, feature_to_idx, 0.9, 1000, 1)
+returns_stat_arb, equity_curve = engine(strategy, market_data[test_idx:], ticker_to_idx, feature_to_idx)
+sharpe = calculate_sharpe_ratio(returns_stat_arb)
 print(sharpe)
 
-returns, equity_curve = engine(strategies.diversify, market_data[test_idx:], ticker_to_idx, feature_to_idx)
-sharpe = calculate_sharpe_ratio(returns)
+# monte_carlo_simulation(strategies.make_MLP_stat_arb, market_data, ticker_to_idx, feature_to_idx, training_fraction, 1000, 1)
+
+returns_diversify, equity_curve = engine(strategies.diversify, market_data[test_idx:], ticker_to_idx, feature_to_idx)
+sharpe = calculate_sharpe_ratio(returns_diversify)
 print(sharpe)
-
-
-# strategy = strategies.long_only_stat_arb_strategy
-# returns, equity_curve = engine(strategy, market_data, ticker_to_idx, feature_to_idx)
-# sharpe = calculate_sharpe_ratio(returns)
-# print(sharpe)
-
-# import matplotlib.pyplot as plt
-# plt.figure(figsize=(10,4))
-# # plt.plot(np.array(equity_curve)*(sharpe/equity_curve[-1]), label="strategy equity")
-# plt.plot(equity_curve, label="strategy equity")
-
-
-# def diversify(capital_allocation, market_data, ticker_to_idx, feature_to_idx):
-#     factor_indices = np.array([ticker_to_idx["SPY"], ticker_to_idx["XLK"]])
-#     trading_indices = np.setdiff1d(np.arange(len(capital_allocation)), factor_indices)
-#     w = np.zeros(len(capital_allocation))
-#     w[trading_indices] = 1
-#     w /= w.sum()
-#     return w
-
-# returns, equity_curve = engine(diversify, market_data, ticker_to_idx, feature_to_idx)
-# sharpe = calculate_sharpe_ratio(returns)
-# # plt.plot(np.array(equity_curve)*(sharpe/equity_curve[-1]), label="diversified equity")
-# plt.plot(equity_curve, label="diversified equity")
-
-# print(sharpe)
-
-# plt.show()
-
-# # make_strat = lambda market_data, ticker_to_idx, feature_to_idx, training_fraction: strategies.long_only_stat_arb_strategy
-# # p_value, mean, std = monte_carlo_simulation(make_strat, market_data, ticker_to_idx, feature_to_idx, training_fraction=0.0, num_simulations=1000)
-# # print(p_value, mean, std)

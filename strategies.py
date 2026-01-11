@@ -788,9 +788,20 @@ def make_MLP_stat_arb(market_data, ticker_to_idx, feature_to_idx, training_fract
                 continue
 
             # AR(1) fit
-            x0 = x[:-1] - x[:-1].mean()
-            x1 = x[1:]  - x[1:].mean()
-            phi = (x0 @ x1) / (x0 @ x0 + 1e-8)
+            # x0 = x[:-1] - x[:-1].mean()
+            # x1 = x[1:]  - x[1:].mean()
+            # phi = (x[:-1] @ x[1:]) / (x[:-1] @ x[:-1] + 1e-8)
+            # X: (T, N)  where X = cumsum(e) over time
+            X0 = x[:-1]
+            X1 = x[1:]
+
+            # Fit phi and intercept a in least squares: X1 ≈ a + phi*X0
+            # phi = Cov(X0, X1) / Var(X0)
+            X0m = X0 - X0.mean(axis=0, keepdims=True)
+            X1m = X1 - X1.mean(axis=0, keepdims=True)
+
+            phi = (X0m * X1m).sum(axis=0) / ((X0m * X0m).sum(axis=0) + 1e-8)
+
 
             hl = -np.log(2) / np.log(abs(phi) + 1e-8)
 
@@ -847,7 +858,7 @@ def make_MLP_stat_arb(market_data, ticker_to_idx, feature_to_idx, training_fract
                 loss = compute_loss(R, R_hat)
                 residuals = R - R_hat
                 stats = compute_level_stats(R, R_hat)
-            print(stats)
+            # print(stats)
             # print(f"Epoch: {epoch} | Training Loss: {loss.item():.6f} | Test Loss: {test_loss.item():.6f} | Residual Mean: {residuals.mean().item():.6f}, STD: {residuals.std().item():.6f}")
 
     def strategy(capital_allocation, market_data, ticker_to_idx, feature_to_idx):
@@ -873,10 +884,10 @@ def make_MLP_stat_arb(market_data, ticker_to_idx, feature_to_idx, training_fract
         w_neutral = w - proj
 
         w_neutral = w_neutral.detach().numpy()
-        gross = np.sum(np.abs(w_neutral))
 
-        if gross == 0:
-            return np.zeros(n_tickers)
+        w_neutral = 0.3*w_neutral + 0.7*np.ones(n_tickers)/n_tickers
+
+        gross = np.sum(np.abs(w_neutral))
         
         return w_neutral / gross
 
