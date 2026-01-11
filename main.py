@@ -19,7 +19,7 @@ def engine(strategy, market_data, ticker_to_idx, feature_to_idx):
     equity_curve = [1.0]
     for d in range(len(market_data) - 2):
         w = strategy(w, market_data[:d + 1], ticker_to_idx, feature_to_idx)
-        gross = np.mean(np.abs(w))
+        gross = np.sum(np.abs(w))
         if(gross > 1.001):
             raise ValueError("Gross greater than 1")
 
@@ -117,7 +117,7 @@ def format_yfinance_data(tickers, period):
 
 # tickers = ["AAPL", "MSFT", "GOOG", "NVDA", "META", "AMZN", "TSLA", "SPY", "XLK"]
 # tickers = ["AAPL", "MSFT", "GOOG", "NVDA", "SPY", "XLK"]
-tickers = ["AAPL", "MSFT", "GOOG", "NVDA", "META", "AMZN", "TSLA"]
+tickers = ["AAPL", "MSFT", "GOOG", "NVDA", "META", "TSLA"]
 # tickers = [
 #     "AAPL","MSFT","GOOGL","AMZN","META","NVDA","TSLA","BRK-B","JPM","V",
 #     "UNH","HD","MA","XOM","LLY","PG","AVGO","COST","PEP","ADBE",
